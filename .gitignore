@@ -6,6 +6,7 @@ __pycache__/
 # C extensions
 *.so
 refinet
+refinet1
 
 # Distribution / packaging
 .Python

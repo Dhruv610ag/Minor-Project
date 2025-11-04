@@ -9,3 +9,6 @@ torch==2.2.2
 torchvision==0.17.2
 torchaudio==2.2.2
 tqdm==4.67.1
+seaborn==0.13.2
+pandas==2.2.3
+psutil==5.9.5
