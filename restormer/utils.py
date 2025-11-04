@@ -51,6 +51,7 @@ def setup_device(gpu_id=None):
         print(f" Error setting up device: {e}")
         return torch.device("cpu")
 
+# Add missing functions here if not in utils.py
 def create_experiment_name(base_name):
     """Create unique experiment name with timestamp"""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

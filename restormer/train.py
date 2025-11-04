@@ -7,25 +7,26 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 from tqdm import tqdm
+from datetime import datetime
 
 # Import your modules
 from dataset import VimeoDataset
 from models.restormer import RestormerTeacher
-from models.ghostnet import GhostNetStudentSR
+from models.ghostnet import GhostNetFeatureExtractor
 from models.mbd import MultiBlockDistillation
 from models.feature_alignment import FeatureAlignmentModule
 from models.sr_network import SRNetwork, IntegratedGhostSR
-from metrices import calculate_all_metrics
-from validators import validate_student, validate_teacher, validate_distillation
-from utils import setup_device, check_dataset_structure, create_experiment_name, setup_logging
+from metrices import calculate_all_metrics, calculate_ssim
+from validators import validate_student, validate_teacher
+from utils import setup_device, check_dataset_structure,create_experiment_name,setup_logging
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Restormer-GhostNet Knowledge Distillation Training")
     
     # Data parameters
-    parser.add_argument("--data_path", type=str, default="./data", help="Path to dataset directory")
-    parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints", help="Path to save checkpoints")
-    parser.add_argument("--log_dir", type=str, default="./logs", help="TensorBoard log directory")
+    parser.add_argument("--data_path", type=str, default="/kaggle/input/archive/vimeo_settuplet_1", help="Path to dataset directory")
+    parser.add_argument("--checkpoint_dir", type=str, default="/kaggle/working/checkpoints", help="Path to save checkpoints")
+    parser.add_argument("--log_dir", type=str, default="/kaggle/working/logs", help="TensorBoard log directory")
     
     # Model parameters
     parser.add_argument("--teacher_checkpoint", type=str, required=True, help="Path to teacher checkpoint")
@@ -33,10 +34,10 @@ def parse_args():
     parser.add_argument("--frame_count", type=int, default=3, help="Number of input frames for student")
     
     # Training parameters
-    parser.add_argument("--batch_size", type=int, default=8, help="Batch size for training")
-    parser.add_argument("--num_epochs", type=int, default=100, help="Number of training epochs")
+    parser.add_argument("--batch_size", type=int, default=4, help="Batch size for training")
+    parser.add_argument("--num_epochs", type=int, default=50, help="Number of training epochs")
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate")
-    parser.add_argument("--num_workers", type=int, default=4, help="Number of dataloader workers")
+    parser.add_argument("--num_workers", type=int, default=2, help="Number of dataloader workers")
     parser.add_argument("--gpu_id", type=int, default=0, help="GPU ID to use")
     
     # Distillation parameters
@@ -53,6 +54,7 @@ def parse_args():
 
 def create_models_and_criteria(args, device):
     """Create teacher, student models and loss criteria"""
+    print("🧠 Creating teacher model...")
     # Teacher model (frozen)
     teacher = RestormerTeacher(
         checkpoint_path=args.teacher_checkpoint,
@@ -60,16 +62,20 @@ def create_models_and_criteria(args, device):
         device=device
     )
     
-    # Student model
-    # Create GhostNet feature extractor and SR reconstruction network, then integrate
-    ghostnet = GhostNetStudentSR(scale_factor=args.scale_factor)
-    # GhostNet feature extractor outputs 32 channels in the provided implementation
-    sr_net = SRNetwork(in_channels=32, out_channels=3, num_res_blocks=5, scale_factor=args.scale_factor)
-    student = IntegratedGhostSR(ghostnet, sr_net).to(device)
+    print("🎓 Creating student model...")
+    # Student model - use the complete integrated model
+    # Calculate input channels: frame_count * 3 (RGB channels)
+    input_channels = args.frame_count * 3
+    ghostnet_fe = GhostNetFeatureExtractor(in_channels=input_channels)  # Feature extractor
+    sr_net = SRNetwork(in_channels=32, out_channels=3, scale_factor=args.scale_factor)  # SR reconstruction
+    student = IntegratedGhostSR(ghostnet_fe, sr_net).to(device)
+    
+    print(f"📊 Teacher parameters: {sum(p.numel() for p in teacher.parameters()):,}")
+    print(f"📊 Student parameters: {sum(p.numel() for p in student.parameters()):,}")
     
     # Loss functions
-    pixel_criterion = nn.L1Loss()  # Pixel-wise loss
-    distill_criterion = nn.MSELoss()  # Distillation loss
+    pixel_criterion = nn.L1Loss()
+    distill_criterion = nn.MSELoss()
     
     # Multi-block distillation module
     mbd_module = MultiBlockDistillation(
@@ -79,12 +85,15 @@ def create_models_and_criteria(args, device):
     ).to(device)
     
     # Feature alignment module
-    feature_aligner = FeatureAlignmentModule(alignment_type='conv').to(device)
+    feature_aligner = FeatureAlignmentModule(
+        alignment_type='concat',  # Simple concatenation for frames
+        flow_estimation=False
+    ).to(device)
     
     return teacher, student, pixel_criterion, distill_criterion, mbd_module, feature_aligner
 
 def train_epoch(student, teacher, train_loader, pixel_criterion, distill_criterion, 
-                mbd_module, optimizer, device, feature_aligner, distill_weight=0.5):
+                optimizer, device, feature_aligner, distill_weight=0.5):
     """Train for one epoch"""
     student.train()
     teacher.eval()
@@ -107,20 +116,17 @@ def train_epoch(student, teacher, train_loader, pixel_criterion, distill_criteri
         
         # Forward passes
         with torch.no_grad():
-            # Teacher processes center frame
+            # Teacher processes center frame only
             center_frame = lr_frames[:, lr_frames.size(1)//2, :, :, :]
             teacher_output = teacher(center_frame)
         
-        # Prepare student input: align/concatenate frames -> [B, N*C, H, W]
-        # feature_aligner.forward_student expects frames [B, N, C, H, W]
-        lr_input = feature_aligner.forward_student(lr_frames)
-        # Student forward expects (x, bicubic)
-        student_output = student(lr_input, bicubic_frames)
+        # Student forward - use feature aligner to prepare input
+        # lr_frames shape: [B, N, C, H, W] -> feature_aligner -> [B, N*C, H, W]
+        student_input = feature_aligner.forward_student(lr_frames)
+        student_output = student(student_input, bicubic_frames)
         
         # Calculate losses
         pixel_loss = pixel_criterion(student_output, hr_frames)
-        
-        # Distillation loss (simplified - would need feature extraction hooks)
         distill_loss = distill_criterion(student_output, teacher_output.detach())
         
         # Total loss
@@ -128,6 +134,10 @@ def train_epoch(student, teacher, train_loader, pixel_criterion, distill_criteri
         
         # Backward pass
         loss.backward()
+        
+        # Gradient clipping to prevent explosions
+        torch.nn.utils.clip_grad_norm_(student.parameters(), max_norm=1.0)
+        
         optimizer.step()
         
         # Update metrics
@@ -149,11 +159,64 @@ def train_epoch(student, teacher, train_loader, pixel_criterion, distill_criteri
         'distill_loss': total_distill_loss / batch_count
     }
 
+def simple_validate(student, teacher, val_loader, pixel_criterion, device, feature_aligner):
+    """Simple validation function with SSIM"""
+    student.eval()
+    teacher.eval()
+    
+    total_student_loss = 0
+    total_teacher_loss = 0
+    student_psnr = 0
+    teacher_psnr = 0
+    student_ssim = 0
+    teacher_ssim = 0
+    samples_count = 0
+    
+    with torch.no_grad():
+        for lr_frames, hr_frames, bicubic_frames in val_loader:
+            lr_frames = lr_frames.to(device)
+            hr_frames = hr_frames.to(device)
+            bicubic_frames = bicubic_frames.to(device)
+            
+            # Teacher inference
+            center_frame = lr_frames[:, lr_frames.size(1)//2, :, :, :]
+            teacher_output = teacher(center_frame)
+            teacher_loss = pixel_criterion(teacher_output, hr_frames)
+            
+            # Student inference
+            student_input = feature_aligner.forward_student(lr_frames)
+            student_output = student(student_input, bicubic_frames)
+            student_loss = pixel_criterion(student_output, hr_frames)
+            
+            # Calculate PSNR and SSIM
+            batch_size = lr_frames.size(0)
+            for i in range(batch_size):
+                student_psnr += calculate_all_metrics(student_output[i], hr_frames[i])['psnr']
+                teacher_psnr += calculate_all_metrics(teacher_output[i], hr_frames[i])['psnr']
+                
+                # Calculate SSIM
+                student_ssim += calculate_ssim(student_output[i].unsqueeze(0), hr_frames[i].unsqueeze(0))
+                teacher_ssim += calculate_ssim(teacher_output[i].unsqueeze(0), hr_frames[i].unsqueeze(0))
+            
+            total_student_loss += student_loss.item()
+            total_teacher_loss += teacher_loss.item()
+            samples_count += batch_size
+    
+    return {
+        'student_loss': total_student_loss / len(val_loader),
+        'teacher_loss': total_teacher_loss / len(val_loader),
+        'student_psnr': student_psnr / samples_count,
+        'teacher_psnr': teacher_psnr / samples_count,
+        'student_ssim': student_ssim / samples_count,
+        'teacher_ssim': teacher_ssim / samples_count
+    }
+
 def main():
     args = parse_args()
     
     # Setup device
     device = setup_device(args.gpu_id)
+    print(f"🔧 Using device: {device}")
     
     # Create experiment name and directories
     experiment_name = create_experiment_name("restormer_ghostnet_distill")
@@ -170,30 +233,15 @@ def main():
     teacher, student, pixel_criterion, distill_criterion, mbd_module, feature_aligner = \
         create_models_and_criteria(args, device)
     
-    # Optimizer
+    # Optimizer (only for student)
     optimizer = optim.Adam(student.parameters(), lr=args.learning_rate, betas=(0.9, 0.999))
-    
-    # Learning rate scheduler
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.5)
-    
-    # Resume training if specified
-    start_epoch = 0
-    if args.resume:
-        if os.path.isfile(args.resume):
-            print(f"📂 Resuming from checkpoint: {args.resume}")
-            checkpoint = torch.load(args.resume, map_location=device)
-            start_epoch = checkpoint['epoch'] + 1
-            student.load_state_dict(checkpoint['student_state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-            print(f"🔄 Resumed from epoch {start_epoch}")
-        else:
-            print(f"⚠  No checkpoint found at: {args.resume}")
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.5)
     
     # Create data loaders
     train_list = os.path.join(args.data_path, "sep_trainlist.txt")
     val_list = os.path.join(args.data_path, "sep_testlist.txt")
     
+    print("📊 Creating datasets...")
     train_dataset = VimeoDataset(
         args.data_path,
         split_list=train_list if os.path.exists(train_list) else None,
@@ -235,18 +283,19 @@ def main():
     
     # Training loop
     best_psnr = 0
-    for epoch in range(start_epoch, args.num_epochs):
+    print("\n🎯 Starting training...")
+    
+    for epoch in range(args.num_epochs):
         print(f"\n📈 Epoch {epoch + 1}/{args.num_epochs}")
         
         # Train
         train_metrics = train_epoch(
             student, teacher, train_loader, pixel_criterion, distill_criterion,
-            mbd_module, optimizer, device, feature_aligner, args.distill_weight
+            optimizer, device, feature_aligner, args.distill_weight
         )
         
         # Validate
-        student_metrics = validate_student(student, val_loader, pixel_criterion, device, args.scale_factor)
-        teacher_metrics = validate_teacher(teacher, val_loader, device, args.scale_factor)
+        val_metrics = simple_validate(student, teacher, val_loader, pixel_criterion, device, feature_aligner)
         
         # Update learning rate
         scheduler.step()
@@ -255,24 +304,39 @@ def main():
         writer.add_scalar('Loss/Train_Total', train_metrics['total_loss'], epoch)
         writer.add_scalar('Loss/Train_Pixel', train_metrics['pixel_loss'], epoch)
         writer.add_scalar('Loss/Train_Distill', train_metrics['distill_loss'], epoch)
-        writer.add_scalar('Loss/Val_Student', student_metrics.get('loss', 0), epoch)
+        writer.add_scalar('Loss/Val_Student', val_metrics['student_loss'], epoch)
+        writer.add_scalar('Loss/Val_Teacher', val_metrics['teacher_loss'], epoch)
         
-        writer.add_scalar('Metrics/PSNR_Student', student_metrics['psnr'], epoch)
-        writer.add_scalar('Metrics/PSNR_Teacher', teacher_metrics['psnr'], epoch)
-        writer.add_scalar('Metrics/SSIM_Student', student_metrics['ssim'], epoch)
-        writer.add_scalar('Metrics/SSIM_Teacher', teacher_metrics['ssim'], epoch)
+        writer.add_scalar('Metrics/PSNR_Student', val_metrics['student_psnr'], epoch)
+        writer.add_scalar('Metrics/PSNR_Teacher', val_metrics['teacher_psnr'], epoch)
+        writer.add_scalar('Metrics/SSIM_Student', val_metrics['student_ssim'], epoch)
+        writer.add_scalar('Metrics/SSIM_Teacher', val_metrics['teacher_ssim'], epoch)
         
         # Print epoch summary
         print(f"✅ Train Loss: {train_metrics['total_loss']:.4f} "
               f"(Pixel: {train_metrics['pixel_loss']:.4f}, Distill: {train_metrics['distill_loss']:.4f})")
-        print(f"📊 Val PSNR - Student: {student_metrics['psnr']:.2f} dB, "
-              f"Teacher: {teacher_metrics['psnr']:.2f} dB")
+        print(f"📊 Val PSNR - Student: {val_metrics['student_psnr']:.2f} dB, "
+              f"Teacher: {val_metrics['teacher_psnr']:.2f} dB")
+        print(f"📊 Val SSIM - Student: {val_metrics['student_ssim']:.4f}, "
+              f"Teacher: {val_metrics['teacher_ssim']:.4f}")
+        print(f"📊 Val Loss - Student: {val_metrics['student_loss']:.4f}, "
+              f"Teacher: {val_metrics['teacher_loss']:.4f}")
         
-        # Save checkpoint
-        if (epoch + 1) % 10 == 0 or student_metrics['psnr'] > best_psnr:
-            if student_metrics['psnr'] > best_psnr:
-                best_psnr = student_metrics['psnr']
-                print(f"🎉 New best PSNR: {best_psnr:.2f} dB")
+        # Save checkpoint - ONLY every 5 epochs OR when PSNR improves
+        should_save_checkpoint = False
+        save_reason = ""
+        
+        if val_metrics['student_psnr'] > best_psnr:
+            best_psnr = val_metrics['student_psnr']
+            should_save_checkpoint = True
+            save_reason = f"🎉 New best PSNR: {best_psnr:.2f} dB"
+        
+        if (epoch + 1) % 5 == 0:  # Save every 5 epochs
+            should_save_checkpoint = True
+            save_reason = f"💾 Regular save at epoch {epoch + 1}"
+        
+        if should_save_checkpoint:
+            print(save_reason)
             
             checkpoint = {
                 'epoch': epoch,
@@ -280,7 +344,7 @@ def main():
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 'train_metrics': train_metrics,
-                'val_metrics': student_metrics,
+                'val_metrics': val_metrics,
                 'best_psnr': best_psnr,
                 'args': vars(args)
             }
@@ -289,12 +353,25 @@ def main():
             torch.save(checkpoint, checkpoint_path)
             print(f"💾 Saved checkpoint: {checkpoint_path}")
     
-    # Save final model
+    # Save final model (always save at the end)
     final_model_path = os.path.join(checkpoint_dir, 'final_model.pth')
-    torch.save(student.state_dict(), final_model_path)
+    torch.save({
+        'student_state_dict': student.state_dict(),
+        'best_psnr': best_psnr,
+        'args': vars(args)
+    }, final_model_path)
     print(f"🏁 Training completed! Final model saved to: {final_model_path}")
     
+    # Print final results
+    print(f"\n🎯 FINAL RESULTS:")
+    print(f"   Best Student PSNR: {best_psnr:.2f} dB")
+    print(f"   Final Student PSNR: {val_metrics['student_psnr']:.2f} dB")
+    print(f"   Final Student SSIM: {val_metrics['student_ssim']:.4f}")
+    print(f"   Teacher PSNR: {val_metrics['teacher_psnr']:.2f} dB")
+    print(f"   Teacher SSIM: {val_metrics['teacher_ssim']:.4f}")
+    
     writer.close()
+    print("✨ Experiment completed successfully!")
 
 if __name__ == "__main__":
     main()
