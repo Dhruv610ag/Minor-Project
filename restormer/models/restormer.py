@@ -12,6 +12,11 @@ class RestormerTeacher(nn.Module):
     def __init__(self, checkpoint_path=None, scale_factor=1, device='cpu'):
         super().__init__()
         
+        self.device = torch.device(device)
+        self.scale_factor = scale_factor
+        
+        print(f"🔧 Initializing RestormerTeacher on device: {self.device}")
+        
         # Use exact architecture that matches pretrained weights
         self.restormer = Restormer(
             inp_channels=3, 
@@ -23,11 +28,11 @@ class RestormerTeacher(nn.Module):
             ffn_expansion_factor=2.66,
             bias=False,
             LayerNorm_type='WithBias',
-            dual_pixel_task=False  # Important for motion_deblurring
+            dual_pixel_task=False
         )
         
-        self.scale_factor = scale_factor
-        self.device = device
+        # Move the entire model to the specified device
+        self.restormer = self.restormer.to(self.device)
         
         if checkpoint_path is not None:
             self.load_pretrained_weights(checkpoint_path)
@@ -38,6 +43,8 @@ class RestormerTeacher(nn.Module):
         self.restormer.eval()
         for param in self.restormer.parameters():
             param.requires_grad = False
+            
+        print(f"✅ RestormerTeacher initialized on {self.device}")
 
     def load_pretrained_weights(self, checkpoint_path):
         """Enhanced loading for official Restormer weights"""
@@ -47,6 +54,9 @@ class RestormerTeacher(nn.Module):
                 return False
                 
             print(f"📂 Loading pretrained weights from: {checkpoint_path}")
+            print(f"📦 Loading to device: {self.device}")
+            
+            # Load checkpoint directly to the target device
             ckpt = torch.load(checkpoint_path, map_location=self.device)
             
             # Official Restormer weights usually have 'params' key
@@ -88,6 +98,10 @@ class RestormerTeacher(nn.Module):
                 if load_result.unexpected_keys:
                     print(f"⚠  First 5 unexpected keys: {load_result.unexpected_keys[:5]}")
             
+            # Verify all parameters are on the correct device
+            all_on_correct_device = all(p.device == self.device for p in self.restormer.parameters())
+            print(f"🔍 All parameters on {self.device}: {all_on_correct_device}")
+            
             return True
             
         except Exception as e:
@@ -105,6 +119,10 @@ class RestormerTeacher(nn.Module):
             Teacher output tensor [B, 3, H', W'] 
         """
         with torch.no_grad():
+            # Ensure input is on the same device as model
+            if x.device != self.device:
+                x = x.to(self.device)
+                
             # Restormer expects input in range [0,1]
             if x.max() > 1.0:
                 x = x / 255.0
@@ -122,3 +140,9 @@ class RestormerTeacher(nn.Module):
                 out = out * 255.0
                 
         return out
+
+    def to(self, device):
+        """Override to method to handle device changes properly"""
+        self.device = torch.device(device)
+        self.restormer = self.restormer.to(self.device)
+        return self
