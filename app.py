@@ -5,228 +5,378 @@ import numpy as np
 import os
 import time
 import io
+from math import log10
 
-class ImageEnhancementApp:
+# Set page config
+st.set_page_config(
+    page_title="Image Enhancement - Knowledge Distillation",
+    page_icon="🖼️",
+    layout="wide"
+)
+
+st.title("🖼️ Image Enhancement with Knowledge Distillation")
+st.markdown("""
+Enhance your images using AI models trained with Knowledge Distillation:
+- **Teacher Model**: Restormer (Motion Deblurring)
+- **Student Model**: GhostNet (Super-Resolution 4×)
+""")
+
+def calculate_psnr(original, enhanced):
+    """Calculate PSNR between original and enhanced images"""
+    mse = np.mean((original - enhanced) ** 2)
+    if mse == 0:
+        return float('inf')
+    max_pixel = 255.0
+    psnr = 20 * log10(max_pixel / np.sqrt(mse))
+    return psnr
+
+def calculate_ssim(original, enhanced):
+    """Calculate SSIM between original and enhanced images"""
+    try:
+        from skimage.metrics import structural_similarity as ssim
+        # Convert to grayscale for SSIM calculation
+        if len(original.shape) == 3:
+            original_gray = np.dot(original[...,:3], [0.2989, 0.5870, 0.1140])
+            enhanced_gray = np.dot(enhanced[...,:3], [0.2989, 0.5870, 0.1140])
+        else:
+            original_gray = original
+            enhanced_gray = enhanced
+        
+        # Ensure same size
+        min_shape = min(original_gray.shape[0], enhanced_gray.shape[0]), min(original_gray.shape[1], enhanced_gray.shape[1])
+        original_gray = original_gray[:min_shape[0], :min_shape[1]]
+        enhanced_gray = enhanced_gray[:min_shape[0], :min_shape[1]]
+        
+        return ssim(original_gray, enhanced_gray, data_range=255)
+    except ImportError:
+        st.warning("SSIM calculation requires scikit-image. Install with: pip install scikit-image")
+        return 0.0
+
+class ImageEnhancer:
     def __init__(self):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.teacher_model = None
-        self.student_model = None
+        self.teacher = None
+        self.student = None
         self.models_loaded = False
-        
-    def load_models(self, teacher_path, student_path):
-        """Load both teacher and student models"""
-        try:
-            # Load teacher model
-            if teacher_path and os.path.exists(teacher_path):
-                from restormer.models.restormer import RestormerTeacher
-                self.teacher_model = RestormerTeacher(
-                    checkpoint_path=teacher_path, 
-                    device=self.device
-                )
-                st.success(f"✅ Teacher model loaded ({sum(p.numel() for p in self.teacher_model.parameters()):,} parameters)")
-            else:
-                st.warning("⚠️ Teacher model path not provided or file doesn't exist")
-            
-            # Load student model  
-            if student_path and os.path.exists(student_path):
-                from restormer.models.ghostnet import GhostNetStudentSR
-                from restormer.models.sr_network import SRNetwork, IntegratedGhostSR
-                
-                ghostnet = GhostNetStudentSR()
-                sr_net = SRNetwork()
-                self.student_model = IntegratedGhostSR(ghostnet, sr_net)
-                
-                # Load student weights
-                student_weights = torch.load(student_path, map_location=self.device)
-                self.student_model.load_state_dict(student_weights)
-                self.student_model.to(self.device)
-                self.student_model.eval()
-                
-                st.success(f"✅ Student model loaded ({sum(p.numel() for p in self.student_model.parameters()):,} parameters)")
-                self.models_loaded = True
-            else:
-                st.warning("⚠️ Student model path not provided or file doesn't exist")
-                
-        except Exception as e:
-            st.error(f"❌ Error loading models: {str(e)}")
-            self.models_loaded = False
 
-    def preprocess_image(self, image):
-        """Preprocess image for model input"""
-        # Convert to RGB if necessary
+    def load_teacher_model(self, model_path):
+        """Load Restormer teacher model for motion deblurring"""
+        try:
+            from restormer.models.restormer import RestormerTeacher
+            self.teacher = RestormerTeacher(checkpoint_path=model_path, device=self.device)
+            st.sidebar.success("✅ Teacher model loaded (Motion Deblurring)")
+            return True
+        except Exception as e:
+            st.error(f"❌ Error loading teacher model: {e}")
+            return False
+
+    def load_student_model(self, model_path):
+        """Load the trained student model for super-resolution"""
+        try:
+            # Import the EXACT same architecture as training
+            from restormer.models.ghostnet import GhostNetFeatureExtractor
+            from restormer.models.sr_network import SRNetwork, IntegratedGhostSR
+            
+            # Create the exact same model as training
+            ghostnet = GhostNetFeatureExtractor(in_channels=9)  # 3 frames × 3 channels
+            sr_net = SRNetwork(in_channels=32, out_channels=3, scale_factor=4)
+            self.student = IntegratedGhostSR(ghostnet, sr_net)
+            self.student.to(self.device)
+            
+            # Load checkpoint
+            checkpoint = torch.load(model_path, map_location=self.device)
+            
+            # Extract student weights
+            if 'student_state_dict' in checkpoint:
+                state_dict = checkpoint['student_state_dict']
+            else:
+                state_dict = checkpoint
+            
+            # Load weights directly - no key renaming needed
+            self.student.load_state_dict(state_dict)
+            self.student.eval()
+            
+            st.sidebar.success("✅ Student model loaded (Super-Resolution 4×)")
+            return True
+            
+        except Exception as e:
+            st.error(f"❌ Error loading student model: {e}")
+            import traceback
+            st.code(traceback.format_exc())
+            return False
+
+    def preprocess_for_teacher(self, image):
+        """Preprocess image for teacher model (motion deblurring)"""
         if image.mode != 'RGB':
             image = image.convert('RGB')
         
-        # Store original size
         original_size = image.size
         
-        # Convert to tensor and normalize
+        # Convert to tensor and normalize to [0, 1]
         img_np = np.array(image).astype(np.float32) / 255.0
         img_tensor = torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0).float()
         
-        return img_tensor, original_size
+        return img_tensor, original_size, img_np
 
-    def postprocess_image(self, tensor, original_size):
-        """Convert model output back to PIL Image"""
-        # Convert tensor to numpy
-        sr_np = tensor.squeeze(0).permute(1, 2, 0).cpu().numpy()
-        sr_np = np.clip(sr_np * 255, 0, 255).astype(np.uint8)
+    def preprocess_for_student(self, image):
+        """Preprocess image for student model (super-resolution with residual learning)"""
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
         
-        # Create PIL Image
-        sr_img = Image.fromarray(sr_np)
+        original_size = image.size
         
-        return sr_img
+        # Convert to tensor and normalize to [0, 1]
+        img_np = np.array(image).astype(np.float32) / 255.0
+        hr_tensor = torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0).float()
+        
+        # Create low-resolution version (4× downscale)
+        _, _, H, W = hr_tensor.shape
+        lr_tensor = torch.nn.functional.interpolate(
+            hr_tensor, 
+            size=(H//4, W//4), 
+            mode='bicubic', 
+            align_corners=False
+        )
+        
+        # Create bicubic upscaled version (what student expects as input)
+        bicubic_tensor = torch.nn.functional.interpolate(
+            lr_tensor,
+            size=(H, W),
+            mode='bicubic',
+            align_corners=False
+        )
+        
+        # Student expects 9 channels (3 frames) - repeat the bicubic image
+        student_input = bicubic_tensor.repeat(1, 3, 1, 1)  # [1, 9, H, W]
+        
+        return student_input, bicubic_tensor, original_size, img_np
 
     def enhance_image(self, image, model_type='student'):
         """Enhance image using selected model"""
         if not self.models_loaded:
-            st.error("Models not loaded! Please load models first.")
-            return None
+            return None, "Models not loaded", None, None
         
         try:
-            # Preprocess
-            img_tensor, original_size = self.preprocess_image(image)
-            img_tensor = img_tensor.to(self.device)
-            
-            # Select model
-            if model_type == 'teacher' and self.teacher_model:
-                model = self.teacher_model
-            elif model_type == 'student' and self.student_model:
-                model = self.student_model
+            original_np = None
+            if model_type == 'teacher':
+                # Teacher: Motion Deblurring
+                img_tensor, original_size, original_np = self.preprocess_for_teacher(image)
+                img_tensor = img_tensor.to(self.device)
+                
+                with torch.no_grad():
+                    start_time = time.time()
+                    output = self.teacher(img_tensor)
+                    inference_time = time.time() - start_time
+                    output = output.clamp(0, 1)
+                
+                st.sidebar.write(f"🔍 Teacher output range: [{output.min():.3f}, {output.max():.3f}]")
+                
             else:
-                st.error(f"Selected model ({model_type}) not available")
-                return None
+                # Student: Super-Resolution with Residual Learning
+                student_input, bicubic_tensor, original_size, original_np = self.preprocess_for_student(image)
+                student_input = student_input.to(self.device)
+                bicubic_tensor = bicubic_tensor.to(self.device)
+                
+                with torch.no_grad():
+                    start_time = time.time()
+                    # Student outputs: residual + bicubic
+                    output = self.student(student_input, bicubic_tensor)
+                    inference_time = time.time() - start_time
+                    output = output.clamp(0, 1)
+                
+                st.sidebar.write(f"🔍 Student output range: [{output.min():.3f}, {output.max():.3f}]")
+                st.sidebar.write(f"🎯 Input was downscaled 4× then enhanced")
             
-            # Inference
-            with torch.no_grad():
-                start_time = time.time()
-                enhanced_tensor = model(img_tensor).clamp(0, 1)
-                inference_time = time.time() - start_time
+            # Convert to image
+            output_np = output.squeeze(0).permute(1, 2, 0).cpu().numpy()
+            output_np = (output_np * 255).astype(np.uint8)
+            enhanced_image = Image.fromarray(output_np)
             
-            # Postprocess
-            enhanced_image = self.postprocess_image(enhanced_tensor, original_size)
+            # Calculate metrics
+            psnr_value = None
+            ssim_value = None
             
-            st.info(f"🕒 Inference time: {inference_time:.2f} seconds")
+            if original_np is not None:
+                # Convert original to same scale for comparison
+                original_uint8 = (original_np * 255).astype(np.uint8)
+                
+                # Ensure same dimensions for metric calculation
+                min_height = min(original_uint8.shape[0], output_np.shape[0])
+                min_width = min(original_uint8.shape[1], output_np.shape[1])
+                
+                original_cropped = original_uint8[:min_height, :min_width]
+                enhanced_cropped = output_np[:min_height, :min_width]
+                
+                psnr_value = calculate_psnr(original_cropped, enhanced_cropped)
+                ssim_value = calculate_ssim(original_cropped, enhanced_cropped)
             
-            return enhanced_image
+            return enhanced_image, f"Success - {inference_time:.2f}s", psnr_value, ssim_value
             
         except Exception as e:
-            st.error(f"❌ Error during enhancement: {str(e)}")
-            return None
+            return None, f"Error: {str(e)}", None, None
 
-def main():
-    st.set_page_config(
-        page_title="Image Enhancement Demo",
-        page_icon="🖼️",
-        layout="wide"
-    )
-    
-    st.title("🖼️ Image Enhancement with Knowledge Distillation")
-    st.markdown("""
-    Enhance your images using AI models trained with Knowledge Distillation:
-    - **Teacher Model**: Restormer (High quality, slower) - Motion Deblurring
-    - **Student Model**: GhostNet (Good quality, faster) - Lightweight version
-    """)
-    
-    # Initialize app
-    if 'app' not in st.session_state:
-        st.session_state.app = ImageEnhancementApp()
-    
-    app = st.session_state.app
-    
-    # Sidebar for model loading
-    st.sidebar.header("🔧 Model Configuration")
-    
-    # Pre-configured model paths
-    TEACHER_PATH = r"C:\Users\DHRUV AGARWAL\Desktop\Minor-Project\models\TeacherModel\motion_deblurring.pth"
-    STUDENT_PATH = r"C:\Users\DHRUV AGARWAL\Desktop\Minor-Project\models\StudentModel\final_student_model.pth"
-    
-    with st.sidebar.expander("📁 Load Models", expanded=True):
-        st.info(f"**Teacher Model**: `{TEACHER_PATH}`")
-        st.info(f"**Student Model**: `{STUDENT_PATH}`")
+# Initialize enhancer
+if 'enhancer' not in st.session_state:
+    st.session_state.enhancer = ImageEnhancer()
+
+enhancer = st.session_state.enhancer
+
+# Sidebar for model loading
+st.sidebar.header("🔧 Model Configuration")
+
+# Model paths
+TEACHER_PATH = r"C:\Users\DHRUV AGARWAL\Desktop\Minor-Project\models\TeacherModel\motion_deblurring.pth"
+STUDENT_PATH = r"C:\Users\DHRUV AGARWAL\Desktop\Minor-Project\models\StudentModel\final_student_model.pth"
+
+# Load models
+if st.sidebar.button("🚀 Load All Models", type="primary"):
+    with st.spinner("Loading models..."):
+        teacher_loaded = enhancer.load_teacher_model(TEACHER_PATH)
+        student_loaded = enhancer.load_student_model(STUDENT_PATH)
         
-        if st.button("🚀 Load Models"):
-            with st.spinner("Loading models..."):
-                app.load_models(TEACHER_PATH, STUDENT_PATH)
-    
-    # Main area for image processing
-    st.header("🎨 Image Enhancement")
-    
-    if app.models_loaded:
-        st.success("✅ Models are loaded and ready!")
+        if teacher_loaded and student_loaded:
+            enhancer.models_loaded = True
+            st.sidebar.success("✅ All models loaded successfully!")
+            
+            # Display model info
+            if enhancer.teacher:
+                teacher_params = sum(p.numel() for p in enhancer.teacher.parameters())
+                st.sidebar.info(f"📊 Teacher parameters: {teacher_params:,}")
+            if enhancer.student:
+                student_params = sum(p.numel() for p in enhancer.student.parameters())
+                st.sidebar.info(f"📊 Student parameters: {student_params:,}")
+        else:
+            st.sidebar.error("❌ Failed to load some models")
+
+# Main interface
+st.header("🎨 Image Enhancement")
+
+if enhancer.models_loaded:
+    st.success("✅ Models are ready for enhancement!")
+else:
+    st.warning("⚠️ Please load models first using the button in the sidebar")
+
+# Model selection with clear descriptions
+col1, col2 = st.columns(2)
+with col1:
+    model_type = st.radio(
+        "Select Model:",
+        ["student", "teacher"],
+        index=0,
+        help="Choose which model to use for enhancement"
+    )
+
+with col2:
+    if model_type == "student":
+        st.info("""
+        **Student Model (GhostNet)**:
+        - 🎯 **Task**: Super-Resolution (4×)
+        - ⚡ **Speed**: Fast inference
+        - 🔧 **Method**: Residual learning
+        - 📱 **Size**: Lightweight
+        - 💡 **Process**: Downscales → Enhances → Upscales
+        """)
     else:
-        st.warning("⚠️ Please load models using the button in the sidebar")
+        st.info("""
+        **Teacher Model (Restormer)**:
+        - 🎯 **Task**: Motion Deblurring
+        - 🎨 **Quality**: High quality
+        - ⏳ **Speed**: Slower inference
+        - 💪 **Power**: Advanced processing
+        - 💡 **Process**: Direct enhancement
+        """)
+
+# Image upload
+uploaded_file = st.file_uploader(
+    "Upload an image to enhance",
+    type=['png', 'jpg', 'jpeg'],
+    help="Supported formats: PNG, JPG, JPEG"
+)
+
+if uploaded_file is not None:
+    # Display original image
+    original_image = Image.open(uploaded_file)
     
-    # Model selection
     col1, col2 = st.columns(2)
     
     with col1:
-        model_type = st.radio(
-            "Select Model:",
-            ["student", "teacher"],
-            index=0,
-            help="Student is faster, Teacher provides higher quality"
-        )
+        st.subheader("📸 Original Image")
+        st.image(original_image, use_container_width=True)
+        st.write(f"**Dimensions:** {original_image.size[0]} × {original_image.size[1]}")
+        st.write(f"**Mode:** {original_image.mode}")
         
-        if model_type == "teacher":
-            st.info("🎯 **Teacher Model**: High-quality enhancement (Slower)")
+        # Show what each model does
+        if model_type == "student":
+            st.info("🎯 Student will: Downscale 4× → Enhance → Output HD")
         else:
-            st.info("⚡ **Student Model**: Fast enhancement (Good quality)")
+            st.info("🎯 Teacher will: Remove motion blur → Output enhanced")
     
     with col2:
-        st.markdown("""
-        **About the Models:**
-        - **Teacher**: Restormer architecture trained for motion deblurring
-        - **Student**: GhostNet architecture - lightweight and efficient
-        - **Technology**: Knowledge Distillation used to transfer learning
-        """)
-    
-    # Image upload
-    uploaded_file = st.file_uploader(
-        "Choose an image to enhance",
-        type=['png', 'jpg', 'jpeg', 'bmp'],
-        help="Upload a blurry or low-quality image for enhancement"
-    )
-    
-    if uploaded_file is not None:
-        # Display original image
-        original_image = Image.open(uploaded_file)
+        st.subheader("✨ Enhanced Image")
         
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.subheader("📸 Original Image")
-            st.image(original_image, use_column_width=True, caption="Input Image")
-            
-            # Original image info
-            st.write(f"**Size**: {original_image.size[0]} × {original_image.size[1]}")
-            st.write(f"**Mode**: {original_image.mode}")
-        
-        with col2:
-            st.subheader("✨ Enhanced Image")
-            
-            if app.models_loaded:
-                if st.button("🔮 Enhance Image", type="primary"):
-                    with st.spinner("Enhancing image..."):
-                        enhanced_image = app.enhance_image(original_image, model_type)
+        if enhancer.models_loaded:
+            if st.button("🔮 Enhance Image", type="primary", use_container_width=True):
+                with st.spinner("Enhancing image..."):
+                    enhanced_image, message, psnr_value, ssim_value = enhancer.enhance_image(original_image, model_type)
+                    
+                    if enhanced_image:
+                        st.image(enhanced_image, use_container_width=True)
+                        st.write(f"**Dimensions:** {enhanced_image.size[0]} × {enhanced_image.size[1]}")
+                        st.success(f"✅ {message}")
                         
-                        if enhanced_image:
-                            st.image(enhanced_image, use_column_width=True, caption=f"Enhanced using {model_type.title()} Model")
+                        # Display metrics
+                        if psnr_value is not None and ssim_value is not None:
+                            col_psnr, col_ssim = st.columns(2)
+                            with col_psnr:
+                                st.metric(
+                                    label="📊 PSNR",
+                                    value=f"{psnr_value:.2f} dB",
+                                    help="Peak Signal-to-Noise Ratio (higher is better)"
+                                )
+                            with col_ssim:
+                                st.metric(
+                                    label="📊 SSIM",
+                                    value=f"{ssim_value:.4f}",
+                                    help="Structural Similarity Index (1.0 is perfect)"
+                                )
                             
-                            # Enhanced image info
-                            st.write(f"**Size**: {enhanced_image.size[0]} × {enhanced_image.size[1]}")
+                            # Interpretation
+                            if psnr_value > 40:
+                                st.success("🎉 Excellent quality (PSNR > 40 dB)")
+                            elif psnr_value > 30:
+                                st.info("👍 Good quality (PSNR 30-40 dB)")
+                            else:
+                                st.warning("⚠️ Moderate quality (PSNR < 30 dB)")
                             
-                            # Download button
-                            buf = io.BytesIO()
-                            enhanced_image.save(buf, format="PNG")
-                            st.download_button(
-                                label="📥 Download Enhanced Image",
-                                data=buf.getvalue(),
-                                file_name=f"enhanced_{model_type}.png",
-                                mime="image/png"
-                            )
-            else:
-                st.warning("⚠️ Please load models first using the button in the sidebar!")
+                            if ssim_value > 0.9:
+                                st.success("🎉 Excellent structural similarity (SSIM > 0.9)")
+                            elif ssim_value > 0.7:
+                                st.info("👍 Good structural similarity (SSIM 0.7-0.9)")
+                            else:
+                                st.warning("⚠️ Moderate structural similarity (SSIM < 0.7)")
+                        
+                        # Download button
+                        buf = io.BytesIO()
+                        enhanced_image.save(buf, format="PNG")
+                        st.download_button(
+                            label="📥 Download Enhanced Image",
+                            data=buf.getvalue(),
+                            file_name=f"enhanced_{model_type}.png",
+                            mime="image/png",
+                            use_container_width=True
+                        )
+                    else:
+                        st.error(f"❌ {message}")
+        else:
+            st.warning("Please load models first!")
 
-if __name__ == "__main__":
-    main()
+# Footer
+st.markdown("---")
+st.markdown("""
+**Metrics Explanation:**
+- **PSNR (Peak Signal-to-Noise Ratio)**: Measures image quality (higher = better)
+- **SSIM (Structural Similarity Index)**: Measures structural similarity (1.0 = perfect)
+""")
+st.markdown(
+    "Built with Streamlit | Knowledge Distillation for Image Enhancement | Teacher: Motion Deblurring | Student: Super-Resolution"
+)
