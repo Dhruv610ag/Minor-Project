@@ -6,10 +6,14 @@ from tqdm import tqdm
 import os
 import time
 import torch.nn.functional as F
+
+# Import your models
+import sys
+sys.path.append('/kaggle/working/restormer')
+
 from restormer.models.restormer import RestormerTeacher   
 from restormer.models.ghostnet import GhostNetStudentSR  
-from restormer.models.sr_network import SRNetwork, IntegratedGhostSR
-from restormer.metrices import calculate_psnr, calculate_ssim, calculate_motion_consistency
+from restormer.metrices import calculate_psnr, calculate_ssim
 
 
 def setup_device(gpu_id=0):
@@ -28,38 +32,84 @@ def setup_device(gpu_id=0):
     return device
 
 
-def load_model(model_type, checkpoint_path, device, scale_factor=1):
+def load_model(model_type, checkpoint_path, device, scale_factor=4):
     """Load appropriate model based on type"""
     if model_type == "teacher":
-        model = RestormerTeacher(checkpoint_path=checkpoint_path,
-                                 scale_factor=scale_factor,
-                                 device=device)
+        model = RestormerTeacher(
+            checkpoint_path=checkpoint_path,
+            scale_factor=scale_factor,
+            device=device
+        )
     elif model_type == "student":
-        # Instantiate integrated student: GhostNet feature extractor + SR network
-        ghostnet = GhostNetStudentSR(scale_factor=scale_factor)
-        sr_net = SRNetwork(in_channels=32, out_channels=3, num_res_blocks=5, scale_factor=scale_factor)
-        model = IntegratedGhostSR(ghostnet, sr_net).to(device)
-        if checkpoint_path:
-            checkpoint = torch.load(checkpoint_path, map_location=device)
-            # checkpoint may be a dict with various keys
-            if isinstance(checkpoint, dict):
-                # try common keys
-                if 'student_state_dict' in checkpoint:
-                    model.load_state_dict(checkpoint['student_state_dict'])
-                elif 'model' in checkpoint:
-                    model.load_state_dict(checkpoint['model'])
+        # Load student model directly (as used in training)
+        model = GhostNetStudentSR(scale_factor=scale_factor).to(device)
+        
+        if checkpoint_path and os.path.exists(checkpoint_path):
+            try:
+                checkpoint = torch.load(checkpoint_path, map_location=device)
+                
+                # Handle different checkpoint formats
+                if isinstance(checkpoint, dict):
+                    if 'student_state_dict' in checkpoint:
+                        model.load_state_dict(checkpoint['student_state_dict'])
+                    elif 'model_state_dict' in checkpoint:
+                        model.load_state_dict(checkpoint['model_state_dict'])
+                    elif 'state_dict' in checkpoint:
+                        model.load_state_dict(checkpoint['state_dict'])
+                    else:
+                        # Assume it's the model itself
+                        model.load_state_dict(checkpoint)
                 else:
-                    # assume checkpoint is a state_dict
                     model.load_state_dict(checkpoint)
-            else:
-                model.load_state_dict(checkpoint)
+                    
+                print(f"✅ Student model loaded from {checkpoint_path}")
+            except Exception as e:
+                print(f"❌ Error loading student model: {e}")
+                print("⚠️ Using untrained student model")
+        else:
+            print("⚠️ No checkpoint provided, using untrained student model")
+            
         model.eval()
     else:
         raise ValueError(f"Unknown model type: {model_type}")
+    
     return model
 
 
-def process_video(model, input_path, output_path, device, scale_factor=4, model_type="teacher"):
+def prepare_student_input(frame, scale_factor=4):
+    """Prepare input for student model (3-frame sequence)"""
+    # Convert to RGB and normalize
+    if len(frame.shape) == 3 and frame.shape[2] == 3:
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    else:
+        frame_rgb = frame
+        
+    frame_normalized = frame_rgb.astype(np.float32) / 255.0
+    
+    # Create low-resolution version
+    h, w = frame_normalized.shape[:2]
+    lr_h, lr_w = h // scale_factor, w // scale_factor
+    lr_frame = cv2.resize(frame_normalized, (lr_w, lr_h), interpolation=cv2.INTER_AREA)
+    
+    # Create 3-frame sequence by duplicating (for single frame inference)
+    # In real usage, you'd use actual consecutive frames
+    frame_sequence = [lr_frame, lr_frame, lr_frame]
+    
+    # Convert to tensor [1, 3, 3, H, W] -> [1, 9, H, W]
+    frames_tensor = torch.from_numpy(np.stack(frame_sequence)).float()
+    frames_tensor = frames_tensor.permute(0, 3, 1, 2).unsqueeze(0)  # [1, 3, 3, H, W]
+    B, N, C, H, W = frames_tensor.shape
+    frames_tensor = frames_tensor.view(B, N * C, H, W)
+    
+    # Create bicubic upsampled version
+    bicubic_frame = cv2.resize(lr_frame, (w, h), interpolation=cv2.INTER_CUBIC)
+    bicubic_tensor = torch.from_numpy(bicubic_frame).float()
+    bicubic_tensor = bicubic_tensor.permute(2, 0, 1).unsqueeze(0)
+    
+    return frames_tensor, bicubic_tensor
+
+
+def process_video(model, input_path, output_path, device, scale_factor=4, model_type="student"):
     """Process a video file using the specified model"""
     if not os.path.exists(input_path):
         raise FileNotFoundError(f"Input video not found: {input_path}")
@@ -77,8 +127,8 @@ def process_video(model, input_path, output_path, device, scale_factor=4, model_
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     out = cv2.VideoWriter(output_path, fourcc, fps, (out_width, out_height))
 
-    frame_buffer = []
     frame_count = 0
+    frame_buffer = []
 
     with tqdm(total=total_frames, desc=f"Processing video ({model_type})") as pbar:
         while cap.isOpened():
@@ -86,37 +136,32 @@ def process_video(model, input_path, output_path, device, scale_factor=4, model_
             if not ret:
                 break
 
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-
             if model_type == "teacher":
+                # Teacher processes single frame
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
                 frame_tensor = torch.from_numpy(frame_rgb).permute(2, 0, 1).unsqueeze(0).to(device)
+                
                 with torch.no_grad():
                     output = model(frame_tensor)
 
             elif model_type == "student":
-                # Build LR buffer by downsampling input frames to LR
-                lr_frame = cv2.resize(frame_rgb, (width // scale_factor, height // scale_factor), interpolation=cv2.INTER_AREA)
-                frame_buffer.append(lr_frame)
+                # Student needs 3-frame sequence
+                frame_buffer.append(frame)
                 if len(frame_buffer) < 3:
                     pbar.update(1)
                     continue
+                    
                 if len(frame_buffer) > 3:
                     frame_buffer = frame_buffer[-3:]
-                # stack LR frames [N, H, W, C]
-                frame_sequence = np.stack(frame_buffer, axis=0)
-                # to tensor [1, N, C, H, W]
-                frame_tensor = torch.from_numpy(frame_sequence).permute(0, 3, 1, 2).unsqueeze(0)
-                # reshape to concatenated channels [1, N*C, H, W]
-                B, N, C, H_lr, W_lr = frame_tensor.shape
-                frame_tensor = frame_tensor.view(B, N * C, H_lr, W_lr).to(device)
-
-                # create bicubic upsampled center LR frame to HR size
-                center_lr = frame_buffer[len(frame_buffer)//2]
-                bicubic_np = cv2.resize(center_lr, (out_width, out_height), interpolation=cv2.INTER_CUBIC)
-                bicubic_tensor = torch.from_numpy(bicubic_np).permute(2, 0, 1).unsqueeze(0).to(device)
-
+                
+                # Process the middle frame using 3-frame context
+                current_frame = frame_buffer[1]  # Use middle frame
+                input_tensor, bicubic_tensor = prepare_student_input(current_frame, scale_factor)
+                input_tensor = input_tensor.to(device)
+                bicubic_tensor = bicubic_tensor.to(device)
+                
                 with torch.no_grad():
-                    output = model(frame_tensor, bicubic_tensor)
+                    output = model(input_tensor, bicubic_tensor)
 
             # Convert output to numpy
             output_np = output.squeeze(0).cpu().numpy()
@@ -131,132 +176,83 @@ def process_video(model, input_path, output_path, device, scale_factor=4, model_
 
     cap.release()
     out.release()
-    print(f"Processed {frame_count} frames. Output saved to: {output_path}")
+    print(f"✅ Processed {frame_count} frames. Output saved to: {output_path}")
 
 
-def evaluate_video(model, input_path, gt_path, device, scale_factor=4, model_type="teacher"):
-    """Evaluate model performance on video with ground truth"""
-    cap_input = cv2.VideoCapture(input_path)
-    cap_gt = cv2.VideoCapture(gt_path)
+def process_single_image(model, input_path, output_path, device, scale_factor=4, model_type="student"):
+    """Process a single image"""
+    if not os.path.exists(input_path):
+        raise FileNotFoundError(f"Input image not found: {input_path}")
     
-    if not cap_input.isOpened() or not cap_gt.isOpened():
-        raise ValueError("Cannot open input or ground truth video")
+    # Read image
+    image = cv2.imread(input_path)
+    if image is None:
+        raise ValueError(f"Cannot read image: {input_path}")
     
-    total_frames = min(
-        int(cap_input.get(cv2.CAP_PROP_FRAME_COUNT)),
-        int(cap_gt.get(cv2.CAP_PROP_FRAME_COUNT)),
-    )
-
-    metrics = {"psnr": 0.0, "ssim": 0.0, "moc": 0.0}
-    hr_frames, sr_frames, frame_buffer = [], [], []
-
-    with tqdm(total=total_frames, desc="Evaluating video") as pbar:
-        for _ in range(total_frames):
-            ret_input, frame_input = cap_input.read()
-            ret_gt, frame_gt = cap_gt.read()
-            if not ret_input or not ret_gt:
-                break
-
-            frame_input_rgb = cv2.cvtColor(frame_input, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-            frame_gt_rgb = cv2.cvtColor(frame_gt, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-
-            if model_type == "teacher":
-                frame_tensor = torch.from_numpy(frame_input_rgb).permute(2, 0, 1).unsqueeze(0).to(device)
-            else:  # student
-                # downsample to LR and buffer
-                lr_frame = cv2.resize(frame_input_rgb, (int(frame_input.shape[1]//scale_factor), int(frame_input.shape[0]//scale_factor)), interpolation=cv2.INTER_AREA)
-                frame_buffer.append(lr_frame)
-                if len(frame_buffer) < 3:
-                    pbar.update(1)
-                    continue
-                if len(frame_buffer) > 3:
-                    frame_buffer = frame_buffer[-3:]
-                frame_sequence = np.stack(frame_buffer, axis=0)
-                frame_tensor = torch.from_numpy(frame_sequence).permute(0, 3, 1, 2).unsqueeze(0)
-                B, N, C, H_lr, W_lr = frame_tensor.shape
-                frame_tensor = frame_tensor.view(B, N * C, H_lr, W_lr).to(device)
-
-            # For student, pass bicubic upsampled center LR as second arg; teacher ignores second arg
-            with torch.no_grad():
-                if model_type == "student":
-                    # create bicubic upsampled center LR to match GT/HR size
-                    center_lr = frame_buffer[len(frame_buffer)//2]
-                    bicubic_np = cv2.resize(center_lr, (frame_gt_rgb.shape[1], frame_gt_rgb.shape[0]), interpolation=cv2.INTER_CUBIC)
-                    bicubic_tensor = torch.from_numpy(bicubic_np).permute(2, 0, 1).unsqueeze(0).to(device)
-                    output = model(frame_tensor, bicubic_tensor)
-                else:
-                    output = model(frame_tensor)
-
-            output_np = output.squeeze(0).cpu().numpy()
-            sr_tensor = torch.from_numpy(output_np)
-            hr_tensor = torch.from_numpy(frame_gt_rgb).permute(2, 0, 1)
-
-            # Match sizes if needed
-            if sr_tensor.shape[1:] != hr_tensor.shape[1:]:
-                hr_tensor = F.interpolate(hr_tensor.unsqueeze(0),
-                                          size=sr_tensor.shape[1:],
-                                          mode="bicubic",
-                                          align_corners=False).squeeze(0)
-
-            sr_frames.append(sr_tensor)
-            hr_frames.append(hr_tensor)
-            pbar.update(1)
-
-    cap_input.release()
-    cap_gt.release()
-
-    if sr_frames and hr_frames:
-        sr_tensor = torch.stack(sr_frames)
-        hr_tensor = torch.stack(hr_frames)
-
-        for i in range(len(hr_frames)):
-            metrics["psnr"] += calculate_psnr(sr_tensor[i], hr_tensor[i])
-            metrics["ssim"] += calculate_ssim(sr_tensor[i], hr_tensor[i])
-
-        metrics["psnr"] /= len(hr_frames)
-        metrics["ssim"] /= len(hr_frames)
-        metrics["moc"] = calculate_motion_consistency(sr_tensor, hr_tensor)
-
-    return metrics, len(hr_frames)
+    if model_type == "teacher":
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        image_tensor = torch.from_numpy(image_rgb).permute(2, 0, 1).unsqueeze(0).to(device)
+        
+        with torch.no_grad():
+            output = model(image_tensor)
+            
+    elif model_type == "student":
+        input_tensor, bicubic_tensor = prepare_student_input(image, scale_factor)
+        input_tensor = input_tensor.to(device)
+        bicubic_tensor = bicubic_tensor.to(device)
+        
+        with torch.no_grad():
+            output = model(input_tensor, bicubic_tensor)
+    
+    # Convert output
+    output_np = output.squeeze(0).cpu().numpy()
+    output_np = np.transpose(output_np, (1, 2, 0))
+    output_np = np.clip(output_np * 255, 0, 255).astype(np.uint8)
+    output_bgr = cv2.cvtColor(output_np, cv2.COLOR_RGB2BGR)
+    
+    cv2.imwrite(output_path, output_bgr)
+    print(f"✅ Image processed and saved to: {output_path}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Video Enhancement Inference")
-    parser.add_argument("--model-type", choices=["teacher", "student"], required=True)
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint")
-    parser.add_argument("--input", type=str, required=True, help="Input video path")
-    parser.add_argument("--output", type=str, help="Output video path")
-    parser.add_argument("--gt", type=str, help="Ground truth video path for evaluation")
-    parser.add_argument("--evaluate", action="store_true", help="Run evaluation if ground truth is provided")
-    parser.add_argument("--scale", type=int, default=4, help="Scale factor (default: 4)")
-    parser.add_argument("--gpu", type=int, default=0, help="GPU ID (default: 0)")
+    parser = argparse.ArgumentParser(description="Restormer-GhostNet Inference")
+    parser.add_argument("--model-type", choices=["teacher", "student"], required=True, 
+                       help="Model type to use")
+    parser.add_argument("--checkpoint", type=str, required=True, 
+                       help="Path to model checkpoint")
+    parser.add_argument("--input", type=str, required=True, 
+                       help="Input image/video path")
+    parser.add_argument("--output", type=str, required=True, 
+                       help="Output path")
+    parser.add_argument("--scale", type=int, default=4, 
+                       help="Scale factor (default: 4)")
+    parser.add_argument("--gpu", type=int, default=0, 
+                       help="GPU ID (default: 0)")
     
     args = parser.parse_args()
 
+    # Setup device
     device = setup_device(args.gpu)
+    
+    # Load model
     print(f"Loading {args.model_type} model from {args.checkpoint}...")
     model = load_model(args.model_type, args.checkpoint, device, args.scale)
-    print("Model loaded successfully!")
+    print("✅ Model loaded successfully!")
 
-    if args.evaluate and args.gt:
-        print(f"Evaluating {args.model_type} model...")
-        start_time = time.time()
-        metrics, processed_frames = evaluate_video(model, args.input, args.gt, device, args.scale, args.model_type)
-        eval_time = time.time() - start_time
-
-        print("\n📊 Evaluation Results:")
-        print(f"PSNR: {metrics['psnr']:.2f} dB")
-        print(f"SSIM: {metrics['ssim']:.4f}")
-        print(f"Motion Consistency: {metrics['moc']:.4f}")
-        print(f"Evaluation time: {eval_time:.2f} seconds")
-        print(f"FPS: {processed_frames / eval_time:.2f}")
-
-    if args.output:
-        print(f"Processing video with {args.model_type} model...")
-        start_time = time.time()
+    # Check if input is image or video
+    is_video = args.input.lower().endswith(('.mp4', '.avi', '.mov', '.mkv', '.webm'))
+    
+    start_time = time.time()
+    
+    if is_video:
+        print("🎥 Processing video...")
         process_video(model, args.input, args.output, device, args.scale, args.model_type)
-        process_time = time.time() - start_time
-        print(f"Processing completed in {process_time:.2f} seconds")
+    else:
+        print("🖼️ Processing image...")
+        process_single_image(model, args.input, args.output, device, args.scale, args.model_type)
+    
+    process_time = time.time() - start_time
+    print(f"⏱️ Processing completed in {process_time:.2f} seconds")
 
 
 if __name__ == "__main__":

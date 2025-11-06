@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Super Resolution Testing</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+        .upload-section {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+        .upload-area {
+            border: 2px dashed #ccc;
+            border-radius: 10px;
+            padding: 40px;
+            text-align: center;
+            margin-bottom: 20px;
+            transition: border-color 0.3s;
+        }
+        .upload-area:hover {
+            border-color: #007bff;
+        }
+        .upload-area.dragover {
+            border-color: #007bff;
+            background-color: #f0f8ff;
+        }
+        .btn {
+            background-color: #007bff;
+            color: white;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 16px;
+            margin: 5px;
+        }
+        .btn:hover {
+            background-color: #0056b3;
+        }
+        .btn:disabled {
+            background-color: #6c757d;
+            cursor: not-allowed;
+        }
+        .btn.success {
+            background-color: #28a745;
+        }
+        .btn.success:hover {
+            background-color: #218838;
+        }
+        .results {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            margin-top: 20px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+        .result-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+            margin-top: 20px;
+        }
+        .result-item {
+            text-align: center;
+        }
+        .result-item img, .result-item video {
+            max-width: 100%;
+            border-radius: 5px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+        .metrics {
+            background: #e9ecef;
+            padding: 15px;
+            border-radius: 5px;
+            margin-top: 15px;
+        }
+        .loading {
+            display: none;
+            text-align: center;
+            padding: 20px;
+        }
+        .progress-section {
+            display: none;
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            margin-top: 20px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+        .progress-bar {
+            width: 100%;
+            height: 20px;
+            background-color: #f0f0f0;
+            border-radius: 10px;
+            overflow: hidden;
+            margin: 10px 0;
+        }
+        .progress-fill {
+            height: 100%;
+            background-color: #007bff;
+            width: 0%;
+            transition: width 0.5s ease;
+        }
+        .error {
+            color: #dc3545;
+            background: #f8d7da;
+            padding: 10px;
+            border-radius: 5px;
+            margin-top: 10px;
+        }
+        .success {
+            color: #155724;
+            background: #d4edda;
+            padding: 10px;
+            border-radius: 5px;
+            margin-top: 10px;
+        }
+        .spinner {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #3498db;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 2s linear infinite;
+            margin: 0 auto;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        .file-type-indicator {
+            font-size: 12px;
+            color: #666;
+            margin-top: 5px;
+        }
+        .video-controls {
+            margin-top: 15px;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>Restormer-GhostNet Super Resolution</h1>
+        <p>Upload an image or video for 4x super-resolution using our efficient GhostNet student model</p>
+        <p><strong>4x Scale Factor</strong> | Knowledge Distilled from Restormer Teacher</p>
+        <p style="font-size: 14px; color: #666;">Powered by GhostNet Student Model (Lightweight & Fast)</p>
+    </div>
+
+    <div class="upload-section">
+        <h2>Upload Test File</h2>
+        <div class="upload-area" id="uploadArea">
+            <p>Click to select an image or video, or drag and drop here</p>
+            <input type="file" id="fileInput" accept="image/*,video/*" style="display: none;">
+            <p style="font-size: 12px; color: #666; margin-top: 10px;">
+                <strong>Images:</strong> JPG, PNG, GIF | <strong>Videos:</strong> MP4, AVI, MOV, MKV<br>
+                Max size: 100MB
+            </p>
+        </div>
+        <button class="btn" id="uploadBtn" disabled>Process File</button>
+        
+        <div class="loading" id="loading">
+            <div class="spinner"></div>
+            <p id="loadingText">Processing your file with Restormer-GhostNet model...</p>
+        </div>
+    </div>
+
+    <div class="progress-section" id="progressSection">
+        <h3>Video Processing Progress</h3>
+        <div class="progress-bar">
+            <div class="progress-fill" id="progressFill"></div>
+        </div>
+        <p id="progressText">Processing frame 0 of 0...</p>
+        <p style="font-size: 12px; color: #666;">This may take several minutes depending on video length.</p>
+    </div>
+
+    <div class="results" id="results" style="display: none;">
+        <h2 id="resultsTitle">Super Resolution Results</h2>
+        <div class="metrics" id="metrics"></div>
+        <div class="result-grid" id="resultGrid"></div>
+        <div class="video-controls" id="videoControls" style="display: none;">
+            <button class="btn success" id="downloadBtn" onclick="downloadVideo()">
+                📥 Download Processed Video
+            </button>
+        </div>
+    </div>
+
+    <script>
+        const uploadArea = document.getElementById('uploadArea');
+        const fileInput = document.getElementById('fileInput');
+        const uploadBtn = document.getElementById('uploadBtn');
+        const loading = document.getElementById('loading');
+        const loadingText = document.getElementById('loadingText');
+        const progressSection = document.getElementById('progressSection');
+        const progressFill = document.getElementById('progressFill');
+        const progressText = document.getElementById('progressText');
+        const results = document.getElementById('results');
+        const resultsTitle = document.getElementById('resultsTitle');
+        const resultGrid = document.getElementById('resultGrid');
+        const metrics = document.getElementById('metrics');
+        const videoControls = document.getElementById('videoControls');
+        const downloadBtn = document.getElementById('downloadBtn');
+
+        let currentTaskId = null;
+        let progressInterval = null;
+
+        // File input handling
+        uploadArea.addEventListener('click', () => fileInput.click());
+        
+        uploadArea.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            uploadArea.classList.add('dragover');
+        });
+        
+        uploadArea.addEventListener('dragleave', () => {
+            uploadArea.classList.remove('dragover');
+        });
+        
+        uploadArea.addEventListener('drop', (e) => {
+            e.preventDefault();
+            uploadArea.classList.remove('dragover');
+            const files = e.dataTransfer.files;
+            if (files.length > 0) {
+                fileInput.files = files;
+                handleFileSelect();
+            }
+        });
+
+        fileInput.addEventListener('change', handleFileSelect);
+
+        function handleFileSelect() {
+            const file = fileInput.files[0];
+            if (file) {
+                const isVideo = file.type.startsWith('video/');
+                const fileType = isVideo ? 'Video' : 'Image';
+                uploadArea.innerHTML = `
+                    <p>Selected: ${file.name}</p>
+                    <div class="file-type-indicator">${fileType} • ${(file.size / (1024*1024)).toFixed(1)} MB</div>
+                `;
+                uploadBtn.disabled = false;
+                uploadBtn.textContent = `Process ${fileType}`;
+            }
+        }
+
+        uploadBtn.addEventListener('click', processFile);
+
+        async function processFile() {
+            const file = fileInput.files[0];
+            if (!file) return;
+
+            const formData = new FormData();
+            formData.append('file', file);
+            const isVideo = file.type.startsWith('video/');
+
+            uploadBtn.disabled = true;
+            loading.style.display = 'block';
+            results.style.display = 'none';
+            progressSection.style.display = 'none';
+            
+            if (isVideo) {
+                loadingText.textContent = 'Extracting frames from video...';
+            }
+
+            try {
+                const response = await fetch('/upload', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                const data = await response.json();
+
+                if (data.success) {
+                    if (data.type === 'video') {
+                        handleVideoProcessing(data);
+                    } else {
+                        displayImageResults(data);
+                    }
+                } else {
+                    showError(data.error || 'Processing failed');
+                }
+            } catch (error) {
+                showError('Network error: ' + error.message);
+            } finally {
+                if (!isVideo) {
+                    loading.style.display = 'none';
+                    uploadBtn.disabled = false;
+                }
+            }
+        }
+
+        function handleVideoProcessing(data) {
+            currentTaskId = data.task_id;
+            loading.style.display = 'none';
+            progressSection.style.display = 'block';
+            
+            progressText.textContent = `Processing frame 0 of ${data.total_frames}...`;
+            
+            // Start polling for progress
+            progressInterval = setInterval(checkProgress, 1000);
+        }
+
+        async function checkProgress() {
+            if (!currentTaskId) return;
+
+            try {
+                const response = await fetch(`/progress/${currentTaskId}`);
+                const data = await response.json();
+
+                if (data.progress !== undefined) {
+                    progressFill.style.width = data.progress + '%';
+                    const currentFrame = Math.floor(data.progress * data.total / 100);
+                    progressText.textContent = `Processing frame ${currentFrame} of ${data.total}...`;
+                }
+
+                if (data.status === 'completed') {
+                    clearInterval(progressInterval);
+                    progressInterval = null;
+                    progressText.textContent = 'Processing completed! Loading results...';
+                    await loadVideoResults();
+                } else if (data.status === 'error') {
+                    clearInterval(progressInterval);
+                    progressInterval = null;
+                    showError(data.error || 'Video processing failed');
+                    resetUI();
+                }
+            } catch (error) {
+                console.error('Error checking progress:', error);
+            }
+        }
+
+        async function loadVideoResults() {
+            try {
+                const response = await fetch(`/result/${currentTaskId}`);
+                const data = await response.json();
+
+                if (data.success) {
+                    displayVideoResults(data);
+                } else {
+                    showError(data.error || 'Failed to load results');
+                }
+            } catch (error) {
+                showError('Error loading results: ' + error.message);
+            } finally {
+                resetUI();
+            }
+        }
+
+        function displayImageResults(data) {
+            resultsTitle.textContent = 'Image Super Resolution Results';
+            
+            // Display metrics
+            metrics.innerHTML = `
+                <h3>Processing Metrics</h3>
+                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px;">
+                    <div><strong>Input Size:</strong> ${data.metrics.input_size}</div>
+                    <div><strong>Output Size:</strong> ${data.metrics.output_size}</div>
+                    <div><strong>Scale Factor:</strong> ${data.metrics.scale_factor}</div>
+                    <div><strong>PSNR vs Bicubic:</strong> ${data.metrics.psnr_improvement}</div>
+                </div>
+            `;
+
+            // Display images
+            resultGrid.innerHTML = `
+                <div class="result-item">
+                    <h3>Input (Low Resolution)</h3>
+                    <img src="${data.input_image}" alt="Input">
+                </div>
+                <div class="result-item">
+                    <h3>Bicubic Upsampling</h3>
+                    <img src="${data.bicubic_image}" alt="Bicubic">
+                </div>
+                <div class="result-item">
+                    <h3>GhostNet Super Resolution</h3>
+                    <img src="${data.sr_image}" alt="Super Resolution">
+                </div>
+            `;
+
+            videoControls.style.display = 'none';
+            results.style.display = 'block';
+        }
+
+        function displayVideoResults(data) {
+            resultsTitle.textContent = 'Video Super Resolution Results';
+            
+            // Display metrics
+            metrics.innerHTML = `
+                <h3>Processing Metrics</h3>
+                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px;">
+                    <div><strong>Total Frames:</strong> ${data.total_frames}</div>
+                    <div><strong>Scale Factor:</strong> 4x</div>
+                    <div><strong>Status:</strong> Completed</div>
+                </div>
+                <div class="success">${data.message}</div>
+            `;
+
+            // Display sample frames
+            resultGrid.innerHTML = `
+                <div class="result-item">
+                    <h3>Sample Frame (Before)</h3>
+                    <img src="${data.sample_input}" alt="Input Sample">
+                    <p style="font-size: 12px; color: #666;">Middle frame from video</p>
+                </div>
+                <div class="result-item">
+                    <h3>Sample Frame (After)</h3>
+                    <img src="${data.sample_sr}" alt="Super Resolution Sample">
+                    <p style="font-size: 12px; color: #666;">Enhanced with GhostNet</p>
+                </div>
+            `;
+
+            videoControls.style.display = 'block';
+            results.style.display = 'block';
+        }
+
+        function downloadVideo() {
+            if (!currentTaskId) return;
+            
+            downloadBtn.disabled = true;
+            downloadBtn.textContent = '📥 Preparing Download...';
+            
+            // Create a temporary link to trigger download
+            const link = document.createElement('a');
+            link.href = `/download_video/${currentTaskId}`;
+            link.download = `ghostnet_output_${currentTaskId}.mp4`;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            
+            // Reset button after a delay
+            setTimeout(() => {
+                downloadBtn.disabled = false;
+                downloadBtn.textContent = '📥 Download Processed Video';
+            }, 3000);
+        }
+
+        function showError(message) {
+            results.innerHTML = `<div class="error">Error: ${message}</div>`;
+            results.style.display = 'block';
+            resetUI();
+        }
+
+        function resetUI() {
+            uploadBtn.disabled = false;
+            uploadBtn.textContent = 'Process File';
+            loading.style.display = 'none';
+            progressSection.style.display = 'none';
+            
+            if (progressInterval) {
+                clearInterval(progressInterval);
+                progressInterval = null;
+            }
+        }
+    </script>
+</body>
+</html>
