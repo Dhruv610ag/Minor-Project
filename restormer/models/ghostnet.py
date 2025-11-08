@@ -86,13 +86,13 @@ class GhostNetFeatureExtractor(nn.Module):
         x = self.bottleneck3(x)
         return x  # [B, 32, H, W]
     
-class GhostNetStudentSR(nn.Module):
-    def __init__(self, scale_factor=4, in_channels=9):
+class GhostNetStudent(nn.Module):  # CHANGED: Renamed from GhostNetStudentSR
+    def __init__(self, in_channels=9):
         super().__init__()
         self.feature_extractor = GhostNetFeatureExtractor(in_channels=in_channels)
-        self.scale_factor = scale_factor
+        # REMOVED: scale_factor parameter
 
     def forward(self, x):
         # expect x of shape [B, N*C, H, W] (concatenated frames)
         features = self.feature_extractor(x)
-        return features  # to be passed to SR reconstruction network
+        return features  # Direct feature output for enhancement

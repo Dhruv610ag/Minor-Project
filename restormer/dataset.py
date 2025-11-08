@@ -9,14 +9,13 @@ from torchvision.transforms import functional as F
 class VimeoDataset(Dataset):
     """
     Dataset for loading sequences of frames from the Vimeo-90k dataset.
-    Returns (low-res frames, high-res center frame, bicubic upsampled frame)
-    for knowledge distillation training.
+    Returns (input frames, target frame) for image enhancement.
     """
     def __init__(self, root_dir, split_list=None, sample_size=None,
-                 scale_factor=4, frame_count=3, patch_size=64,
+                 scale_factor=1, frame_count=3, patch_size=64,  # CHANGED: scale_factor=1
                  is_training=True, verbose=True):
         self.root_dir = root_dir
-        self.scale_factor = scale_factor
+        self.scale_factor = scale_factor  # Now 1 for same resolution
         self.frame_count = frame_count
         self.patch_size = patch_size
         self.is_training = is_training
@@ -148,19 +147,16 @@ class VimeoDataset(Dataset):
                 return True
         return False
     
-    def _random_crop(self, lr_frames, hr_frame):
-        """Perform random crop on LR and HR frames."""
-        h_lr, w_lr = lr_frames[0].shape[:2]
-        crop_x = random.randint(0, w_lr - self.patch_size)
-        crop_y = random.randint(0, h_lr - self.patch_size)
-        cropped_lr = [f[crop_y:crop_y + self.patch_size, crop_x:crop_x + self.patch_size] for f in lr_frames]
-
-        h_hr, w_hr = hr_frame.shape[:2]
-        crop_x_hr = crop_x * self.scale_factor
-        crop_y_hr = crop_y * self.scale_factor
-        cropped_hr = hr_frame[crop_y_hr:crop_y_hr + self.patch_size * self.scale_factor,
-                              crop_x_hr:crop_x_hr + self.patch_size * self.scale_factor]
-        return cropped_lr, cropped_hr
+    def _random_crop(self, frames, target_frame):
+        """Perform random crop on input and target frames (same resolution)"""
+        h, w = frames[0].shape[:2]
+        crop_x = random.randint(0, w - self.patch_size)
+        crop_y = random.randint(0, h - self.patch_size)
+        
+        cropped_frames = [f[crop_y:crop_y + self.patch_size, crop_x:crop_x + self.patch_size] for f in frames]
+        cropped_target = target_frame[crop_y:crop_y + self.patch_size, crop_x:crop_x + self.patch_size]
+        
+        return cropped_frames, cropped_target
 
     def _create_dummy_data(self):
         """Return dummy data if dataset loading fails."""
@@ -191,51 +187,41 @@ class VimeoDataset(Dataset):
                 frame = frame.astype(np.float32) / 255.0
                 frames.append(frame)
 
-            # Get center frame as HR target
+            # Get center frame as target
             center_idx = len(frames) // 2
-            hr_frame = frames[center_idx].copy()
+            target_frame = frames[center_idx].copy()
 
-            # Create LR frames by downsampling
-            lr_frames = []
-            for frame in frames:
-                # Downsample for LR input
-                h, w = frame.shape[:2]
-                lr_frame = cv2.resize(frame, (w // self.scale_factor, h // self.scale_factor),
-                                      interpolation=cv2.INTER_AREA)
-                lr_frames.append(lr_frame)
+            # CHANGED: No downsampling - use original frames as input
+            input_frames = frames  # Same resolution as target
 
-            # Create bicubic upsampled version for residual learning
-            bicubic_frame = cv2.resize(lr_frames[center_idx],
-                                       (hr_frame.shape[1], hr_frame.shape[0]),
-                                       interpolation=cv2.INTER_CUBIC)
+            # CHANGED: bicubic is now the center input frame (same resolution)
+            bicubic_frame = frames[center_idx].copy()
 
             # Data augmentation for training
             if self.is_training and self.patch_size > 0:
                 # Ensure image is large enough for crop
-                h_lr, w_lr = lr_frames[0].shape[:2]
-                if w_lr < self.patch_size or h_lr < self.patch_size:
-                    # fallback: resize LR so we can crop
-                    scale_up = max(self.patch_size / max(w_lr, h_lr), 1.0)
-                    new_w = int(w_lr * scale_up) + 1
-                    new_h = int(h_lr * scale_up) + 1
-                    lr_frames = [cv2.resize(f, (new_w, new_h), interpolation=cv2.INTER_AREA) for f in lr_frames]
-                    bicubic_frame = cv2.resize(lr_frames[center_idx],
-                                               (new_w * self.scale_factor, new_h * self.scale_factor),
-                                               interpolation=cv2.INTER_CUBIC)
-                lr_frames, hr_frame = self._random_crop(lr_frames, hr_frame)
-                # Update bicubic to match cropped HR
-                bicubic_frame = cv2.resize(lr_frames[center_idx],
-                                           (hr_frame.shape[1], hr_frame.shape[0]),
-                                           interpolation=cv2.INTER_CUBIC)
+                h, w = input_frames[0].shape[:2]
+                if w < self.patch_size or h < self.patch_size:
+                    # fallback: resize so we can crop
+                    scale_up = max(self.patch_size / max(w, h), 1.0)
+                    new_w = int(w * scale_up) + 1
+                    new_h = int(h * scale_up) + 1
+                    input_frames = [cv2.resize(f, (new_w, new_h), interpolation=cv2.INTER_AREA) for f in input_frames]
+                    target_frame = cv2.resize(target_frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                    bicubic_frame = cv2.resize(bicubic_frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                
+                input_frames, target_frame = self._random_crop(input_frames, target_frame)
+                # Update bicubic to match cropped target
+                bicubic_frame = input_frames[center_idx]
 
             # Convert to torch tensors
-            lr_tensor = torch.from_numpy(np.stack(lr_frames, axis=0))  # [N, H, W, C]
-            lr_tensor = lr_tensor.permute(0, 3, 1, 2).float()  # [N, C, H, W]
+            input_tensor = torch.from_numpy(np.stack(input_frames, axis=0))  # [N, H, W, C]
+            input_tensor = input_tensor.permute(0, 3, 1, 2).float()  # [N, C, H, W]
 
-            hr_tensor = torch.from_numpy(hr_frame).permute(2, 0, 1).float()  # [C, H, W]
+            target_tensor = torch.from_numpy(target_frame).permute(2, 0, 1).float()  # [C, H, W]
             bicubic_tensor = torch.from_numpy(bicubic_frame).permute(2, 0, 1).float()  # [C, H, W]
 
-            return lr_tensor, hr_tensor, bicubic_tensor
+            return input_tensor, target_tensor, bicubic_tensor
 
         except Exception as e:
             if self.verbose:

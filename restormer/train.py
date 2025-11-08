@@ -10,15 +10,30 @@ from tqdm import tqdm
 from datetime import datetime
 
 # Import your modules
-from dataset import VimeoDataset
-from models.restormer import RestormerTeacher
-from models.ghostnet import GhostNetFeatureExtractor
-from models.mbd import MultiBlockDistillation
-from models.feature_alignment import FeatureAlignmentModule
-from models.sr_network import SRNetwork, IntegratedGhostSR
-from metrices import calculate_all_metrics, calculate_ssim
-from validators import validate_student, validate_teacher
-from utils import setup_device, check_dataset_structure,create_experiment_name,setup_logging
+from restormer.dataset import VimeoDataset
+from restormer.models.restormer import RestormerTeacher
+from restormer.models.ghostnet import GhostNetFeatureExtractor
+from restormer.models.mbd import MultiBlockDistillation
+from restormer.models.feature_alignment import FeatureAlignmentModule
+from restormer.models.sr_network import EnhancementNetwork,IntegratedGhostEnhancer
+from restormer.metrices import calculate_all_metrics, calculate_ssim
+from restormer.utils import setup_device, check_dataset_structure
+
+# Add missing functions here if not in utils.py
+def create_experiment_name(base_name):
+    """Create unique experiment name with timestamp"""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{base_name}_{timestamp}"
+
+def setup_logging(experiment_name, log_dir):
+    """Create experiment directories"""
+    experiment_dir = os.path.join(log_dir, experiment_name)
+    checkpoint_dir = os.path.join(experiment_dir, "checkpoints")
+    
+    os.makedirs(experiment_dir, exist_ok=True)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    return experiment_dir, checkpoint_dir
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Restormer-GhostNet Knowledge Distillation Training")
@@ -30,7 +45,7 @@ def parse_args():
     
     # Model parameters
     parser.add_argument("--teacher_checkpoint", type=str, required=True, help="Path to teacher checkpoint")
-    parser.add_argument("--scale_factor", type=int, default=4, help="Super-resolution scale factor")
+    parser.add_argument("--scale_factor", type=int, default=1, help="Set to 1 for image enhancement")  # CHANGED: default=1
     parser.add_argument("--frame_count", type=int, default=3, help="Number of input frames for student")
     
     # Training parameters
@@ -58,17 +73,20 @@ def create_models_and_criteria(args, device):
     # Teacher model (frozen)
     teacher = RestormerTeacher(
         checkpoint_path=args.teacher_checkpoint,
-        scale_factor=args.scale_factor,
+        scale_factor=1,  # CHANGED: scale_factor=1 for enhancement
         device=device
     )
     
     print("🎓 Creating student model...")
     # Student model - use the complete integrated model
-    # Calculate input channels: frame_count * 3 (RGB channels)
     input_channels = args.frame_count * 3
-    ghostnet_fe = GhostNetFeatureExtractor(in_channels=input_channels)  # Feature extractor
-    sr_net = SRNetwork(in_channels=32, out_channels=3, scale_factor=args.scale_factor)  # SR reconstruction
-    student = IntegratedGhostSR(ghostnet_fe, sr_net).to(device)
+    ghostnet_fe = GhostNetFeatureExtractor(in_channels=input_channels)
+    
+    # CHANGED: Use EnhancementNetwork instead of SRNetwork
+    enhance_net = EnhancementNetwork(in_channels=32, out_channels=3)  # No scale_factor
+    
+    # CHANGED: Use IntegratedGhostEnhancer
+    student = IntegratedGhostEnhancer(ghostnet_fe, enhance_net).to(device)
     
     print(f"📊 Teacher parameters: {sum(p.numel() for p in teacher.parameters()):,}")
     print(f"📊 Student parameters: {sum(p.numel() for p in student.parameters()):,}")
@@ -146,7 +164,7 @@ def train_epoch(student, teacher, train_loader, pixel_criterion, distill_criteri
         total_distill_loss += distill_loss.item()
         batch_count += 1
         
-        # Update progress bar
+        # Update progress bar (student-only metrics shown here)
         progress_bar.set_postfix({
             'Loss': f'{loss.item():.4f}',
             'Pixel': f'{pixel_loss.item():.4f}',
@@ -165,11 +183,8 @@ def simple_validate(student, teacher, val_loader, pixel_criterion, device, featu
     teacher.eval()
     
     total_student_loss = 0
-    total_teacher_loss = 0
     student_psnr = 0
-    teacher_psnr = 0
     student_ssim = 0
-    teacher_ssim = 0
     samples_count = 0
     
     with torch.no_grad():
@@ -178,37 +193,28 @@ def simple_validate(student, teacher, val_loader, pixel_criterion, device, featu
             hr_frames = hr_frames.to(device)
             bicubic_frames = bicubic_frames.to(device)
             
-            # Teacher inference
+            # Teacher inference (still computed for distillation comparison but not logged)
             center_frame = lr_frames[:, lr_frames.size(1)//2, :, :, :]
-            teacher_output = teacher(center_frame)
-            teacher_loss = pixel_criterion(teacher_output, hr_frames)
+            _teacher_output = teacher(center_frame)
             
             # Student inference
             student_input = feature_aligner.forward_student(lr_frames)
             student_output = student(student_input, bicubic_frames)
             student_loss = pixel_criterion(student_output, hr_frames)
             
-            # Calculate PSNR and SSIM
+            # Calculate PSNR and SSIM for student only
             batch_size = lr_frames.size(0)
             for i in range(batch_size):
                 student_psnr += calculate_all_metrics(student_output[i], hr_frames[i])['psnr']
-                teacher_psnr += calculate_all_metrics(teacher_output[i], hr_frames[i])['psnr']
-                
-                # Calculate SSIM
                 student_ssim += calculate_ssim(student_output[i].unsqueeze(0), hr_frames[i].unsqueeze(0))
-                teacher_ssim += calculate_ssim(teacher_output[i].unsqueeze(0), hr_frames[i].unsqueeze(0))
             
             total_student_loss += student_loss.item()
-            total_teacher_loss += teacher_loss.item()
             samples_count += batch_size
     
     return {
         'student_loss': total_student_loss / len(val_loader),
-        'teacher_loss': total_teacher_loss / len(val_loader),
         'student_psnr': student_psnr / samples_count,
-        'teacher_psnr': teacher_psnr / samples_count,
-        'student_ssim': student_ssim / samples_count,
-        'teacher_ssim': teacher_ssim / samples_count
+        'student_ssim': student_ssim / samples_count
     }
 
 def main():
@@ -278,7 +284,7 @@ def main():
     
     print(f"📊 Dataset sizes - Train: {len(train_dataset)}, Val: {len(val_dataset)}")
     
-    # TensorBoard writer
+    # TensorBoard writer (student-only logs)
     writer = SummaryWriter(log_dir=os.path.join(args.log_dir, experiment_name))
     
     # Training loop
@@ -294,33 +300,27 @@ def main():
             optimizer, device, feature_aligner, args.distill_weight
         )
         
-        # Validate
+        # Validate (student-only metrics returned)
         val_metrics = simple_validate(student, teacher, val_loader, pixel_criterion, device, feature_aligner)
         
         # Update learning rate
         scheduler.step()
         
-        # Log metrics
+        # Log student-only metrics
         writer.add_scalar('Loss/Train_Total', train_metrics['total_loss'], epoch)
         writer.add_scalar('Loss/Train_Pixel', train_metrics['pixel_loss'], epoch)
         writer.add_scalar('Loss/Train_Distill', train_metrics['distill_loss'], epoch)
         writer.add_scalar('Loss/Val_Student', val_metrics['student_loss'], epoch)
-        writer.add_scalar('Loss/Val_Teacher', val_metrics['teacher_loss'], epoch)
         
         writer.add_scalar('Metrics/PSNR_Student', val_metrics['student_psnr'], epoch)
-        writer.add_scalar('Metrics/PSNR_Teacher', val_metrics['teacher_psnr'], epoch)
         writer.add_scalar('Metrics/SSIM_Student', val_metrics['student_ssim'], epoch)
-        writer.add_scalar('Metrics/SSIM_Teacher', val_metrics['teacher_ssim'], epoch)
         
-        # Print epoch summary
+        # Print epoch summary (student-only)
         print(f"✅ Train Loss: {train_metrics['total_loss']:.4f} "
               f"(Pixel: {train_metrics['pixel_loss']:.4f}, Distill: {train_metrics['distill_loss']:.4f})")
-        print(f"📊 Val PSNR - Student: {val_metrics['student_psnr']:.2f} dB, "
-              f"Teacher: {val_metrics['teacher_psnr']:.2f} dB")
-        print(f"📊 Val SSIM - Student: {val_metrics['student_ssim']:.4f}, "
-              f"Teacher: {val_metrics['teacher_ssim']:.4f}")
-        print(f"📊 Val Loss - Student: {val_metrics['student_loss']:.4f}, "
-              f"Teacher: {val_metrics['teacher_loss']:.4f}")
+        print(f"📊 Val PSNR - Student: {val_metrics['student_psnr']:.2f} dB")
+        print(f"📊 Val SSIM - Student: {val_metrics['student_ssim']:.4f}")
+        print(f"📊 Val Loss - Student: {val_metrics['student_loss']:.4f}")
         
         # Save checkpoint - ONLY every 5 epochs OR when PSNR improves
         should_save_checkpoint = False
@@ -362,13 +362,11 @@ def main():
     }, final_model_path)
     print(f"🏁 Training completed! Final model saved to: {final_model_path}")
     
-    # Print final results
-    print(f"\n🎯 FINAL RESULTS:")
+    # Print final results (student-only)
+    print(f"\n🎯 FINAL RESULTS (Student Only):")
     print(f"   Best Student PSNR: {best_psnr:.2f} dB")
     print(f"   Final Student PSNR: {val_metrics['student_psnr']:.2f} dB")
     print(f"   Final Student SSIM: {val_metrics['student_ssim']:.4f}")
-    print(f"   Teacher PSNR: {val_metrics['teacher_psnr']:.2f} dB")
-    print(f"   Teacher SSIM: {val_metrics['teacher_ssim']:.4f}")
     
     writer.close()
     print("✨ Experiment completed successfully!")
