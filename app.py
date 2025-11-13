@@ -17,8 +17,8 @@ st.set_page_config(
 st.title("🖼️ Image Enhancement with Knowledge Distillation")
 st.markdown("""
 Enhance your images using AI models trained with Knowledge Distillation:
-- **Teacher Model**: Restormer (Motion Deblurring)
-- **Student Model**: GhostNet (Super-Resolution 4×)
+- **Teacher Model**: Restormer (Image Enhancement)
+- **Student Model**: GhostNet (Image Enhancement)
 """)
 
 def calculate_psnr(original, enhanced):
@@ -60,43 +60,50 @@ class ImageEnhancer:
         self.models_loaded = False
 
     def load_teacher_model(self, model_path):
-        """Load Restormer teacher model for motion deblurring"""
+        """Load Restormer teacher model for image enhancement"""
         try:
             from restormer.models.restormer import RestormerTeacher
-            self.teacher = RestormerTeacher(checkpoint_path=model_path, device=self.device)
-            st.sidebar.success("✅ Teacher model loaded (Motion Deblurring)")
+            self.teacher = RestormerTeacher(
+                checkpoint_path=model_path, 
+                scale_factor=1,
+                device=self.device
+            )
+            st.sidebar.success("✅ Teacher model loaded (Image Enhancement)")
             return True
         except Exception as e:
             st.error(f"❌ Error loading teacher model: {e}")
+            import traceback
+            st.code(traceback.format_exc())
             return False
 
     def load_student_model(self, model_path):
-        """Load the trained student model for super-resolution"""
+        """Load the trained student model for image enhancement"""
         try:
-            # Import the EXACT same architecture as training
             from restormer.models.ghostnet import GhostNetFeatureExtractor
-            from restormer.models.sr_network import SRNetwork, IntegratedGhostSR
-            
-            # Create the exact same model as training
-            ghostnet = GhostNetFeatureExtractor(in_channels=9)  # 3 frames × 3 channels
-            sr_net = SRNetwork(in_channels=32, out_channels=3, scale_factor=4)
-            self.student = IntegratedGhostSR(ghostnet, sr_net)
+            from restormer.models.sr_network import EnhancementNetwork, IntegratedGhostEnhancer
+            ghostnet = GhostNetFeatureExtractor(in_channels=9) 
+            enhance_net = EnhancementNetwork(in_channels=32, out_channels=3) 
+            self.student = IntegratedGhostEnhancer(ghostnet, enhance_net)
             self.student.to(self.device)
             
             # Load checkpoint
-            checkpoint = torch.load(model_path, map_location=self.device)
-            
-            # Extract student weights
-            if 'student_state_dict' in checkpoint:
-                state_dict = checkpoint['student_state_dict']
+            if os.path.exists(model_path):
+                checkpoint = torch.load(model_path, map_location=self.device)
+                
+                # Handle different checkpoint formats
+                if 'student_state_dict' in checkpoint:
+                    self.student.load_state_dict(checkpoint['student_state_dict'])
+                elif 'model_state_dict' in checkpoint:
+                    self.student.load_state_dict(checkpoint['model_state_dict'])
+                else:
+                    # Try direct loading
+                    self.student.load_state_dict(checkpoint)
             else:
-                state_dict = checkpoint
+                st.error(f"❌ Model file not found: {model_path}")
+                return False
             
-            # Load weights directly - no key renaming needed
-            self.student.load_state_dict(state_dict)
             self.student.eval()
-            
-            st.sidebar.success("✅ Student model loaded (Super-Resolution 4×)")
+            st.sidebar.success("✅ Student model loaded (Image Enhancement)")
             return True
             
         except Exception as e:
@@ -106,7 +113,7 @@ class ImageEnhancer:
             return False
 
     def preprocess_for_teacher(self, image):
-        """Preprocess image for teacher model (motion deblurring)"""
+        """Preprocess image for teacher model (image enhancement)"""
         if image.mode != 'RGB':
             image = image.convert('RGB')
         
@@ -119,7 +126,7 @@ class ImageEnhancer:
         return img_tensor, original_size, img_np
 
     def preprocess_for_student(self, image):
-        """Preprocess image for student model (super-resolution with residual learning)"""
+        """Preprocess image for student model (image enhancement)"""
         if image.mode != 'RGB':
             image = image.convert('RGB')
         
@@ -127,27 +134,13 @@ class ImageEnhancer:
         
         # Convert to tensor and normalize to [0, 1]
         img_np = np.array(image).astype(np.float32) / 255.0
-        hr_tensor = torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0).float()
+        img_tensor = torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0).float()
         
-        # Create low-resolution version (4× downscale)
-        _, _, H, W = hr_tensor.shape
-        lr_tensor = torch.nn.functional.interpolate(
-            hr_tensor, 
-            size=(H//4, W//4), 
-            mode='bicubic', 
-            align_corners=False
-        )
+        # Student expects 9 channels (3 frames) - repeat the same image
+        student_input = img_tensor.repeat(1, 3, 1, 1)  # [1, 9, H, W]
         
-        # Create bicubic upscaled version (what student expects as input)
-        bicubic_tensor = torch.nn.functional.interpolate(
-            lr_tensor,
-            size=(H, W),
-            mode='bicubic',
-            align_corners=False
-        )
-        
-        # Student expects 9 channels (3 frames) - repeat the bicubic image
-        student_input = bicubic_tensor.repeat(1, 3, 1, 1)  # [1, 9, H, W]
+        # For enhancement, bicubic is the original image (no upscaling)
+        bicubic_tensor = img_tensor.clone()
         
         return student_input, bicubic_tensor, original_size, img_np
 
@@ -159,7 +152,7 @@ class ImageEnhancer:
         try:
             original_np = None
             if model_type == 'teacher':
-                # Teacher: Motion Deblurring
+                # Teacher: Image Enhancement
                 img_tensor, original_size, original_np = self.preprocess_for_teacher(image)
                 img_tensor = img_tensor.to(self.device)
                 
@@ -172,20 +165,20 @@ class ImageEnhancer:
                 st.sidebar.write(f"🔍 Teacher output range: [{output.min():.3f}, {output.max():.3f}]")
                 
             else:
-                # Student: Super-Resolution with Residual Learning
+                # Student: Image Enhancement
                 student_input, bicubic_tensor, original_size, original_np = self.preprocess_for_student(image)
                 student_input = student_input.to(self.device)
                 bicubic_tensor = bicubic_tensor.to(self.device)
                 
                 with torch.no_grad():
                     start_time = time.time()
-                    # Student outputs: residual + bicubic
+                    # Student outputs enhanced image (same resolution)
                     output = self.student(student_input, bicubic_tensor)
                     inference_time = time.time() - start_time
                     output = output.clamp(0, 1)
                 
                 st.sidebar.write(f"🔍 Student output range: [{output.min():.3f}, {output.max():.3f}]")
-                st.sidebar.write(f"🎯 Input was downscaled 4× then enhanced")
+                st.sidebar.write(f"🎯 Processing multi-frame enhancement")
             
             # Convert to image
             output_np = output.squeeze(0).permute(1, 2, 0).cpu().numpy()
@@ -224,9 +217,9 @@ enhancer = st.session_state.enhancer
 # Sidebar for model loading
 st.sidebar.header("🔧 Model Configuration")
 
-# Model paths
+# Model paths - UPDATE THESE TO YOUR ACTUAL PATHS
 TEACHER_PATH = r"C:\Users\DHRUV AGARWAL\Desktop\Minor-Project\models\TeacherModel\motion_deblurring.pth"
-STUDENT_PATH = r"C:\Users\DHRUV AGARWAL\Desktop\Minor-Project\models\StudentModel\final_student_model.pth"
+STUDENT_PATH = r"C:\Users\DHRUV AGARWAL\Desktop\Minor-Project\models\StudentModel\final_student_model (1).pth"
 
 # Load models
 if st.sidebar.button("🚀 Load All Models", type="primary"):
@@ -270,16 +263,16 @@ with col2:
     if model_type == "student":
         st.info("""
         **Student Model (GhostNet)**:
-        - 🎯 **Task**: Super-Resolution (4×)
+        - 🎯 **Task**: Image Enhancement
         - ⚡ **Speed**: Fast inference
-        - 🔧 **Method**: Residual learning
+        - 🔧 **Method**: Multi-frame processing
         - 📱 **Size**: Lightweight
-        - 💡 **Process**: Downscales → Enhances → Upscales
+        - 💡 **Process**: Direct enhancement
         """)
     else:
         st.info("""
         **Teacher Model (Restormer)**:
-        - 🎯 **Task**: Motion Deblurring
+        - 🎯 **Task**: Image Enhancement
         - 🎨 **Quality**: High quality
         - ⏳ **Speed**: Slower inference
         - 💪 **Power**: Advanced processing
@@ -305,11 +298,11 @@ if uploaded_file is not None:
         st.write(f"**Dimensions:** {original_image.size[0]} × {original_image.size[1]}")
         st.write(f"**Mode:** {original_image.mode}")
         
-        # Show what each model does
+        # FIXED: Consistent task descriptions
         if model_type == "student":
-            st.info("🎯 Student will: Downscale 4× → Enhance → Output HD")
+            st.info("🎯 Student will: Process multi-frame input → Enhance details")
         else:
-            st.info("🎯 Teacher will: Remove motion blur → Output enhanced")
+            st.info("🎯 Teacher will: Process single frame → Enhance details")
     
     with col2:
         st.subheader("✨ Enhanced Image")
@@ -377,6 +370,7 @@ st.markdown("""
 - **PSNR (Peak Signal-to-Noise Ratio)**: Measures image quality (higher = better)
 - **SSIM (Structural Similarity Index)**: Measures structural similarity (1.0 = perfect)
 """)
+# FIXED: Consistent footer
 st.markdown(
-    "Built with Streamlit | Knowledge Distillation for Image Enhancement | Teacher: Motion Deblurring | Student: Super-Resolution"
+    "Built with Streamlit | Knowledge Distillation for Image Enhancement | Teacher: Restormer | Student: GhostNet"
 )
